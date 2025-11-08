@@ -1,10 +1,10 @@
-import { assign, createActor, raise, setup } from "xstate";
+import { assign, createActor, fromPromise, raise, setup } from "xstate";
 import { speechstate } from "speechstate";
 import type { Settings } from "speechstate";
 
-import type { DMEvents, DMContext } from "./types";
+import type { DMEvents, DMContext, Message } from "./types";
 
-import { KEY } from "./azure";
+import { KEY } from "./azure.ts";
 
 const azureCredentials = {
   endpoint:
@@ -28,8 +28,36 @@ const dmMachine = setup({
     events: {} as DMEvents,
   },
   actions: {
+        "print": ({ context }) => console.log(context.messages),
+        "spst.speak": ({ context }, params: { utterance: string }) =>
+      context.spstRef.send({
+        type: "SPEAK",
+        value: {
+          utterance: params.utterance,
+        },
+      }),
+          "spst.listen": ({ context }) =>
+      context.spstRef.send({
+        type: "LISTEN",
+      }),
+
     sst_prepare: ({ context }) => context.spstRef.send({ type: "PREPARE" }),
     sst_listen: ({ context }) => context.spstRef.send({ type: "LISTEN" }),
+  },
+  actors: {
+    getModels: fromPromise<any, null>(() => fetch("http://localhost:11434/api/tags").then((response) => response.json())),
+    getLLMansw: fromPromise<any, Message[]>(({input}) => {
+                                              const body = {
+                                                model: "llama3.1",
+                                                // model: "gemma2",
+                                                stream: false,
+                                                messages: input
+                                              };
+                                              return fetch("http://localhost:11434/api/chat", {
+                                                method: "POST",
+                                                body: JSON.stringify(body),
+                                              }).then((response) => response.json());
+                                            })
   },
 }).createMachine({
   id: "DM",
@@ -37,88 +65,126 @@ const dmMachine = setup({
     spstRef: spawn(speechstate, { input: settings }),
     informationState: { latestMove: "ping" },
     lastResult: "",
+    messages: [],
+    ollamaModels: [],
   }),
   initial: "Prepare",
   states: {
+
     Prepare: {
       entry: "sst_prepare",
       on: {
-        ASRTTS_READY: "Main",
+        ASRTTS_READY: "Add_first_message",
       },
     },
-    Main: {
-      type: "parallel",
-      states: {
-        Interpret: {
-          initial: "Idle",
-          states: {
-            Idle: {
-              on: { SPEAK_COMPLETE: "Recognising" },
-            },
-            Recognising: {
-              entry: "sst_listen",
-              on: {
-                LISTEN_COMPLETE: {
-                  target: "Idle",
-                  actions: raise(({ context }) => ({
-                    type: "SAYS",
-                    value: context.lastResult,
-                  })),
-                },
-                RECOGNISED: {
-                  actions: assign(({ event }) => ({
-                    lastResult: event.value[0].utterance,
-                  })),
-                },
-              },
-            },
-          },
+
+    Add_first_message: {
+      entry: assign(({ context }) => ({
+        messages: [
+          ...(context.messages),
+          { role: "assistant", content: "Greet the user, tell them they can ask anything. One sentence only" },
+          // { role: "system", content: "Greet the user, tell them they can ask anything. One sentence only" },
+
+        ],
+      })),
+      always: {target: "LLMGreeting"},
+    },
+
+    Done: {
+      type: "final",
+    },
+
+    LLMGreeting: {
+      invoke: {
+        src: "getLLMansw",
+        input: ({ context }) => context.messages,
+        onDone: {
+          target: "greeting", 
+
+          actions: assign(({context, event}) => {
+            return {
+              messages: [
+                ...(context.messages),
+                { role: "system", content: event.output.message.content},
+                // { role: "assistant", content: event.output.message.content},
+              ],
+            };
+          }),
         },
-        Generate: {
-          initial: "Idle",
-          states: {
-            Speaking: {
-              entry: ({ context, event }) =>
-                context.spstRef.send({
-                  type: "SPEAK",
-                  value: { utterance: (event as any).value },
-                }),
-              on: { SPEAK_COMPLETE: "Idle" },
-            },
-            Idle: {
-              on: { NEXT_MOVE: "Speaking" },
-            },
-          },
+      },
+    },   
+
+    greeting: {
+        entry: {
+          type: "spst.speak",
+          params: ({context}) => ({utterance: `${context.messages[context.messages.length - 1].content}`}),
         },
-        Process: {
-          initial: "Select",
-          states: {
-            Select: {
-              always: {
-                guard: ({ context }) =>
-                  context.informationState.latestMove !== "",
-                actions: raise(({ context }) => ({
-                  type: "NEXT_MOVE",
-                  value: context.informationState.latestMove,
+          on: { SPEAK_COMPLETE: "Loop" },
+     },
+
+    Loop: {
+        initial: "Ask",
+        states:{
+          Speaking: {
+            entry: ({context}) => context.spstRef.send({
+                                                      type:"SPEAK",
+                                                      value: { utterance: context.messages[context.messages.length - 1].content},
+                                                      }),
+            on: {"SPEAK_COMPLETE": "Ask"},
+          },
+
+          Ask: {
+            entry: "sst_listen",
+            on: {
+            LISTEN_COMPLETE: "ChatCompletion",
+            RECOGNISED:{
+              actions: [
+                assign(({ context, event }) => ({
+                  messages: [
+                    ...(context.messages),
+                    { role: "user", content: event.value[0].utterance },
+
+                  ],
                 })),
-                target: "Update",
-              },
+                // assign(event) => console.log((event as any).output),
+              ],
             },
-            Update: {
-              entry: assign({ informationState: { latestMove: "" } }),
-              on: {
-                SAYS: {
-                  target: "Select",
-                  actions: assign(({ event }) => ({
-                    informationState: { latestMove: event.value },
-                  })),
-                },
+            ASR_NOINPUT: {
+              actions: assign(({ context }) => ({
+                  messages: [
+                    ...(context.messages),
+
+                    // { role: "assistant", content: "Tell the user that the system didn't hear anything" },
+                    // { role: "system", content: "Tell the user that the system didn't hear anything" },
+                    { role: "user", content: "Tell the user you didn't hear anything" },
+                  ],
+                })),
+            },
+            },
+          },
+
+
+          ChatCompletion: {
+            entry:"print",
+              invoke: {
+              src: "getLLMansw",
+              input: ({ context }: { context: DMContext }) => context.messages,
+              onDone: {
+                target: "Speaking",
+                actions: assign(({ context, event }: { context: DMContext; event: any }) => {
+                  return {
+                    messages: [
+                      ...(context.messages),
+                      { role: "system", content: (event as any).output.message.content },
+                      // { role: "assistant", content: (event as any).output.message.content },
+                    ],
+                  };
+                }),
               },
             },
           },
-        },
-      },
-    },
+  },
+},
   },
 });
 

@@ -4,8 +4,11 @@ import type { AnyActorRef } from "xstate";
 export interface DMContext {
   spstRef: AnyActorRef;
   lastResult: string;
+  messages: Message[];
   // nextUtterance: string;
   informationState: { latestMove: string };
+  ollamaModels?: string[];
+
 }
 
 export type DMEvents =
@@ -14,3 +17,10 @@ export type DMEvents =
   | { type: "SAYS"; value: string }
   | { type: "NEXT_MOVE"; value: string }
   | { type: "DONE" };
+
+
+export type Message = {
+  role: "assistant" | "user" | "system";
+  content: string;
+}
+
